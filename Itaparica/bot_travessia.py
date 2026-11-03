@@ -70,11 +70,17 @@ def monitorar_travessia():
 
             page.wait_for_timeout(4000)
             
-            # --- CORREÇÃO DO MENU APLICADA AQUI ---
-            page.click("text=Tickets")
-            page.wait_for_timeout(2000) # Espera 2 segundos para a animação do menu descer
-            page.click("text=Hora Marcada - Veículo", force=True) # Força o clique no elemento
-            
+            # --- MENU: Tickets > Hora Marcada - Veículo ---
+            # A página pode ter mais de um item com esse texto (um deles oculto),
+            # então clicamos só no visível; se nenhum aparecer, clicamos via JavaScript.
+            page.locator("text=Tickets").filter(visible=True).first.click()
+            item_menu = page.locator("text=Hora Marcada - Veículo")
+            try:
+                item_menu.filter(visible=True).first.click(timeout=10000)
+            except Exception:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Item do menu oculto, clicando via JavaScript...")
+                item_menu.first.evaluate("el => (el.closest('a') || el).click()")
+
             page.wait_for_timeout(3000)
 
             for busca in BUSCAS:
