@@ -19,20 +19,30 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # Configuração de datas e trechos específicos
+# Cada busca tem sua própria lista de "horarios".
+# Se "horarios" for omitido, usa HORARIOS_PADRAO.
+HORARIOS_PADRAO = ["15:00", "16:00", "17:00", "18:00", "19:00", "20:00"]
+
 BUSCAS = [
     {
-        "data": "19/06/2026",
+        "data": "19/11/2026",
         "trecho": "SÃO JOAQUIM (SALVADOR) / BOM DESPACHO (ITAPARICA)",
-        "sentido": "Salvador ➔ Itaparica"
+        "sentido": "Salvador ➔ Itaparica",
+        "horarios": ["15:00", "16:00", "17:00", "18:00", "19:00", "20:00"]
     },
     {
-        "data": "24/06/2026",
+        "data": "20/11/2026",
+        "trecho": "SÃO JOAQUIM (SALVADOR) / BOM DESPACHO (ITAPARICA)",
+        "sentido": "Salvador ➔ Itaparica",
+        "horarios": ["06:00", "07:00", "08:00", "09:00", "10:00", "11:00" , "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00"]
+    },
+    {
+        "data": "22/11/2026",
         "trecho": "BOM DESPACHO (ITAPARICA) / SÃO JOAQUIM (SALVADOR)",
-        "sentido": "Itaparica ➔ Salvador"
+        "sentido": "Itaparica ➔ Salvador",
+        "horarios": ["12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00" , "21:00"]
     }
 ]
-
-HORARIOS_DESEJADOS = ["15:00", "16:00", "17:00", "18:00", "19:00", "20:00"]
 
 # ==========================================
 # 2. FUNÇÕES DO BOT
@@ -75,6 +85,7 @@ def monitorar_travessia():
                 data_atual = busca["data"]
                 trecho_atual = busca["trecho"]
                 sentido_atual = busca["sentido"]
+                horarios_atual = busca.get("horarios", HORARIOS_PADRAO)
 
                 print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Preenchendo os filtros para {data_atual} ({sentido_atual})...")
                 
@@ -109,7 +120,7 @@ def monitorar_travessia():
                             
                             vagas_disponiveis = int(vagas_texto) if vagas_texto.isdigit() else 0
 
-                            if horario_tabela in HORARIOS_DESEJADOS and vagas_disponiveis > 0:
+                            if horario_tabela in horarios_atual and vagas_disponiveis > 0:
                                 alertas_vagas.append(f"⏰ {horario_tabela} -> 🚗 Vagas: {vagas_disponiveis}")
 
                     botao_proximo = page.locator('.ui-paginator-next').first
@@ -152,8 +163,11 @@ def home():
 def iniciar_bot():
     print("Iniciando o bot de monitoramento do Ferry Boat na nuvem...")
     
-    datas_monitoradas = ", ".join([b["data"] for b in BUSCAS])
-    mensagem_inicio = f"✅ *Bot Iniciado na Nuvem (Render)!*\nMonitorando vagas para os dias: {datas_monitoradas}."
+    datas_monitoradas = "\n".join(
+        f"• {b['data']} ({b['sentido']}): {', '.join(b.get('horarios', HORARIOS_PADRAO))}"
+        for b in BUSCAS
+    )
+    mensagem_inicio = f"✅ *Bot Iniciado na Nuvem (Render)!*\nMonitorando vagas para:\n{datas_monitoradas}"
     enviar_notificacao(mensagem_inicio)
 
     while True:
