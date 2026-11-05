@@ -61,6 +61,25 @@ def enviar_notificacao(mensagem):
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Erro no Telegram (Tentativa {tentativa}/{max_tentativas}): {e}")
             time.sleep(5)
 
+def preencher_data(page, data, tentativas=3):
+    """Preenche o campo de data esperando a página terminar de carregar.
+    Se a página recarregar no meio (navegação), tenta de novo."""
+    for tentativa in range(1, tentativas + 1):
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=60000)
+            page.wait_for_selector('[id="form:dataViagem_input"]', state="attached", timeout=60000)
+            page.evaluate(
+                '(data) => { const c = document.getElementById("form:dataViagem_input");'
+                ' c.removeAttribute("readonly"); c.value = data; }',
+                data,
+            )
+            return
+        except Exception as e:
+            if "context was destroyed" not in str(e) or tentativa == tentativas:
+                raise
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Página recarregou ao preencher a data, tentando de novo ({tentativa}/{tentativas})...")
+            page.wait_for_timeout(2000)
+
 def monitorar_travessia():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -98,8 +117,8 @@ def monitorar_travessia():
                 horarios_atual = busca.get("horarios", HORARIOS_PADRAO)
 
                 print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Filtros para {data_atual} ({sentido_atual})...")
-                page.evaluate('(data) => { document.getElementById("form:dataViagem_input").removeAttribute("readonly"); document.getElementById("form:dataViagem_input").value = data; }', data_atual)
-                
+                preencher_data(page, data_atual)
+
                 page.click('[id="form:trecho"] .ui-selectonemenu-trigger')
                 page.wait_for_timeout(1000)
                 page.click(f'li:has-text("{trecho_atual}")')
@@ -204,6 +223,8 @@ def resumir_erro(erro):
         resumo = "O site demorou demais para responder."
     elif "not visible" in texto:
         resumo = "Um botão ou menu do site não apareceu."
+    elif "context was destroyed" in texto:
+        resumo = "A página recarregou no meio da busca."
     elif "net::" in texto or "ERR_" in texto:
         resumo = "Sem conexão com o site."
     else:
