@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+import textwrap
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 import telebot
@@ -117,7 +118,8 @@ def monitorar_travessia():
                             vagas_disponiveis = int(vagas_texto) if vagas_texto.isdigit() else 0
 
                             if horario_tabela in horarios_atual and vagas_disponiveis > 0:
-                                alertas_vagas.append(f"⏰ {horario_tabela} -> 🚗 Vagas: {vagas_disponiveis}")
+                                palavra = "vaga" if vagas_disponiveis == 1 else "vagas"
+                                alertas_vagas.append(f"⏰ {formatar_hora(horario_tabela)} · 🚗 {vagas_disponiveis} {palavra}")
 
                     botao_proximo = page.locator('.ui-paginator-next').first
                     classe_botao = botao_proximo.get_attribute('class') or ""
@@ -130,14 +132,25 @@ def monitorar_travessia():
 
                 if alertas_vagas:
                     linhas_mensagem = "\n".join(alertas_vagas)
-                    mensagem = f"🚨 VAGA(S) ENCONTRADA(S) NO FERRY! 🚨\n\n🗓 Data: {data_atual}\n⛴️ Sentido: {sentido_atual}\n\n{linhas_mensagem}\n\nCorra no site para comprar!"
+                    mensagem = (
+                        f"🚨 VAGA NO FERRY! 🚨\n\n"
+                        f"{icone_sentido(sentido_atual)} {sentido_atual}\n"
+                        f"📅 {formatar_data(data_atual)}\n\n"
+                        f"{linhas_mensagem}\n\n"
+                        f"👉 Corra no site!"
+                    )
                     enviar_notificacao(mensagem)
                 else:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] Nenhuma vaga em {data_atual}.")
 
         except Exception as e:
-            erro_resumo = str(e)[:150] 
-            msg_erro = f"⚠️ ALERTA DO BOT ⚠️\nO site do Sigom falhou ou está lento!\n\nMotivo:\n{erro_resumo}"
+            msg_erro = (
+                f"⚠️ Problema no bot\n\n"
+                f"O site do Sigom falhou\n"
+                f"ou está lento.\n\n"
+                f"Motivo:\n{resumir_erro(e)}\n\n"
+                f"🔄 Tento de novo em {INTERVALO_CHECAGEM // 60} min"
+            )
             enviar_notificacao(msg_erro)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Erro: {e}")
         finally:
@@ -153,15 +166,92 @@ app = Flask(__name__)
 def home():
     return "Bot do Ferry Boat está rodando a todo vapor!"
 
+INTERVALO_CHECAGEM = 300  # segundos entre cada checagem
+
+DIAS_SEMANA = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+ICONES_SENTIDO = ["🟦", "🟧", "🟩", "🟪"]
+LARGURA_CELULAR = 28  # caracteres por linha para não quebrar no celular
+
+def formatar_hora(hhmm):
+    """'15:00' -> '15h' | '15:30' -> '15h30'"""
+    try:
+        h, m = hhmm.split(":")[:2]
+        return f"{h}h" if m == "00" else f"{h}h{m}"
+    except ValueError:
+        return hhmm
+
+def formatar_data(data_str):
+    """'19/11/2026' -> 'Qui 19/11'"""
+    data = datetime.strptime(data_str, "%d/%m/%Y").date()
+    return f"{DIAS_SEMANA[data.weekday()]} {data.strftime('%d/%m')}"
+
+def lista_sentidos():
+    """Sentidos na ordem em que aparecem em BUSCAS."""
+    sentidos = []
+    for b in BUSCAS:
+        if b["sentido"] not in sentidos:
+            sentidos.append(b["sentido"])
+    return sentidos
+
+def icone_sentido(sentido):
+    """Mesmo ícone do sentido em todas as mensagens."""
+    return ICONES_SENTIDO[lista_sentidos().index(sentido) % len(ICONES_SENTIDO)]
+
+def resumir_erro(erro):
+    """Traduz erros comuns e quebra o texto na largura do celular."""
+    texto = str(erro)
+    if "Timeout" in texto:
+        resumo = "O site demorou demais para responder."
+    elif "not visible" in texto:
+        resumo = "Um botão ou menu do site não apareceu."
+    elif "net::" in texto or "ERR_" in texto:
+        resumo = "Sem conexão com o site."
+    else:
+        resumo = texto.splitlines()[0][:100] if texto else type(erro).__name__
+    return "\n".join(textwrap.wrap(resumo, LARGURA_CELULAR))
+
+def formatar_horarios(horarios):
+    """Faixa ('15h às 20h') se forem de hora em hora seguidos; senão, lista curta."""
+    ordenados = sorted(horarios)
+    minutos = [int(h[:2]) * 60 + int(h[3:]) for h in ordenados]
+    seguidos = len(minutos) > 1 and all(b - a == 60 for a, b in zip(minutos, minutos[1:]))
+    if seguidos:
+        return [f"{formatar_hora(ordenados[0])} às {formatar_hora(ordenados[-1])}"]
+    # Lista não sequencial: quebra em linhas de até 4 horários para caber no celular
+    curtos = [formatar_hora(h) for h in ordenados]
+    return [", ".join(curtos[i:i + 4]) for i in range(0, len(curtos), 4)]
+
+def montar_mensagem_inicio():
+    hoje = datetime.now(FUSO_SALVADOR).date()
+    linhas = ["⛴️ Monitor do Ferry ligado!"]
+
+    for sentido in lista_sentidos():
+        linhas_sentido = []
+        for b in BUSCAS:
+            if b["sentido"] != sentido:
+                continue
+            data = datetime.strptime(b["data"], "%d/%m/%Y").date()
+            if data < hoje:
+                continue  # data já passou
+            faixas = formatar_horarios(b.get("horarios", HORARIOS_PADRAO))
+            linhas_sentido.append(f"  📅 {formatar_data(b['data'])} · {faixas[0]}")
+            linhas_sentido += [f"       {f}" for f in faixas[1:]]
+        if linhas_sentido:
+            linhas += ["", f"{icone_sentido(sentido)} {sentido}"] + linhas_sentido
+
+    if len(linhas) == 1:
+        linhas += ["", "⚠️ Nenhuma data futura configurada!"]
+
+    linhas += [
+        "",
+        f"🔄 Checando a cada {INTERVALO_CHECAGEM // 60} min",
+        f"😴 Pausa das {HORA_DORMIR:02d}h às {HORA_ACORDAR:02d}h",
+    ]
+    return "\n".join(linhas)
+
 def iniciar_bot():
-    print("Iniciando o bot de monitoramento do Ferry Boat na nuvem...")
-    
-    datas_monitoradas = "\n".join(
-        f"• {b['data']} ({b['sentido']}): {', '.join(b.get('horarios', HORARIOS_PADRAO))}"
-        for b in BUSCAS
-    )
-    mensagem_inicio = f"✅ Bot Iniciado!\nMonitorando vagas para:\n{datas_monitoradas}"
-    enviar_notificacao(mensagem_inicio)
+    print("Iniciando o bot de monitoramento do Ferry Boat...")
+    enviar_notificacao(montar_mensagem_inicio())
 
     while True:
         agora = datetime.now(FUSO_SALVADOR)
@@ -169,14 +259,14 @@ def iniciar_bot():
             acordar = agora.replace(hour=HORA_ACORDAR, minute=0, second=0, microsecond=0)
             segundos = (acordar - agora).total_seconds()
             print(f"[{agora.strftime('%H:%M:%S')}] Hora de dormir. Volto às {HORA_ACORDAR:02d}:00...")
-            enviar_notificacao(f"😴 Bot pausado até as {HORA_ACORDAR:02d}:00. Boa noite!")
+            enviar_notificacao(f"😴 Boa noite!\n\nBot pausado até as {HORA_ACORDAR:02d}h.")
             time.sleep(segundos)
-            enviar_notificacao("☀️ Bom dia! Bot voltou a monitorar as vagas.")
+            enviar_notificacao("☀️ Bom dia!\n\nVoltei a monitorar\nas vagas.")
             continue
 
         monitorar_travessia()
-        tempo_espera = 300 
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Aguardando 5 minutos...\n")
+        tempo_espera = INTERVALO_CHECAGEM
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Aguardando {tempo_espera // 60} minutos...\n")
         time.sleep(tempo_espera)
 
 if __name__ == "__main__":
