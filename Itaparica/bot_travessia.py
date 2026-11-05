@@ -4,8 +4,15 @@ import threading
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 import telebot
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from flask import Flask
+
+# Horário de Salvador (UTC-3, sem horário de verão)
+FUSO_SALVADOR = timezone(timedelta(hours=-3))
+
+# Período em que o bot não checa vagas (você está dormindo)
+HORA_DORMIR = 1   # 01:00
+HORA_ACORDAR = 6  # 06:00
 
 # Carrega as variáveis de ambiente
 load_dotenv()
@@ -157,6 +164,16 @@ def iniciar_bot():
     enviar_notificacao(mensagem_inicio)
 
     while True:
+        agora = datetime.now(FUSO_SALVADOR)
+        if HORA_DORMIR <= agora.hour < HORA_ACORDAR:
+            acordar = agora.replace(hour=HORA_ACORDAR, minute=0, second=0, microsecond=0)
+            segundos = (acordar - agora).total_seconds()
+            print(f"[{agora.strftime('%H:%M:%S')}] Hora de dormir. Volto às {HORA_ACORDAR:02d}:00...")
+            enviar_notificacao(f"😴 Bot pausado até as {HORA_ACORDAR:02d}:00. Boa noite!")
+            time.sleep(segundos)
+            enviar_notificacao("☀️ Bom dia! Bot voltou a monitorar as vagas.")
+            continue
+
         monitorar_travessia()
         tempo_espera = 300 
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Aguardando 5 minutos...\n")
