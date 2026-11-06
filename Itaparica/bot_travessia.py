@@ -1,12 +1,20 @@
 import os
+import sys
 import time
 import threading
 import textwrap
+import traceback
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 import telebot
 from datetime import datetime, timedelta, timezone
 from flask import Flask
+
+# Evita erro ao imprimir emojis/acentos em terminais do Windows
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # Horário de Salvador (UTC-3, sem horário de verão)
 FUSO_SALVADOR = timezone(timedelta(hours=-3))
@@ -55,10 +63,10 @@ def enviar_notificacao(mensagem):
         try:
             bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
             bot.send_message(TELEGRAM_CHAT_ID, mensagem, timeout=60)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Notificação enviada com sucesso no Telegram!")
+            log(f"Notificação enviada com sucesso no Telegram!")
             break 
         except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Erro no Telegram (Tentativa {tentativa}/{max_tentativas}): {e}")
+            log(f"Erro no Telegram (Tentativa {tentativa}/{max_tentativas}): {e}")
             time.sleep(5)
 
 def preencher_data(page, data, tentativas=3):
@@ -77,26 +85,161 @@ def preencher_data(page, data, tentativas=3):
         except Exception as e:
             if "context was destroyed" not in str(e) or tentativa == tentativas:
                 raise
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Página recarregou ao preencher a data, tentando de novo ({tentativa}/{tentativas})...")
+            log(f"Página recarregou ao preencher a data, tentando de novo ({tentativa}/{tentativas})...")
             page.wait_for_timeout(2000)
 
+def log(texto):
+    print(f"[{datetime.now(FUSO_SALVADOR).strftime('%H:%M:%S')}] {texto}")
+
+def esperar_ajax(page, minimo_ms):
+    """Espera o tempo mínimo e depois espera o site (PrimeFaces) terminar as requisições."""
+    page.wait_for_timeout(minimo_ms)
+    try:
+        page.wait_for_function(
+            "() => !window.PrimeFaces || !PrimeFaces.ajax || !PrimeFaces.ajax.Queue || PrimeFaces.ajax.Queue.isEmpty()",
+            timeout=30000,
+        )
+    except Exception:
+        pass  # se não der para checar, segue com a espera mínima
+
+def clicar_paginador(page, classe):
+    """Clica num botão do paginador ('ui-paginator-first', 'ui-paginator-next').
+    Devolve False se o botão não existe ou está desativado."""
+    botao = page.locator(f'.{classe}').first
+    # Só lê o atributo se o botão existir (senão o Playwright espera 30s e dá erro)
+    if botao.count() == 0:
+        return False
+    if 'ui-state-disabled' in (botao.get_attribute('class') or ""):
+        return False
+    botao.click()
+    esperar_ajax(page, 3000)
+    return True
+
+def ler_vagas(page, busca):
+    """Faz a busca de uma data/trecho e devolve [(horario, vagas), ...] nos horários desejados."""
+    horarios_desejados = busca.get("horarios", HORARIOS_PADRAO)
+
+    # Colunas da tabela: [$, DATA (dd/mm/aa), HORÁRIO, TRECHO, VAGAS DISPONÍVEIS]
+    data_esperada = datetime.strptime(busca["data"], "%d/%m/%Y").strftime("%d/%m/%y")
+
+    def pesquisar():
+        preencher_data(page, busca["data"])
+        page.click('[id="form:trecho"] .ui-selectonemenu-trigger')
+        page.wait_for_timeout(1000)
+        page.click(f'li:has-text("{busca["trecho"]}")')
+        page.click('[id="form:saveRequestButton"]')
+        esperar_ajax(page, 6000)
+        # O site mantém a página do paginador entre buscas: volta para a 1ª
+        clicar_paginador(page, "ui-paginator-first")
+
+    def ler_pagina():
+        """Devolve (linhas desta busca, quantidade de linhas de outra busca)."""
+        validas, de_outra_busca = [], 0
+        for linha in page.locator('[id="form:dataTableListaViagens"] tbody tr').all():
+            colunas = [c.strip() for c in linha.locator('td').all_inner_texts()]
+            if len(colunas) < 5:
+                continue  # linha "Nenhum registro encontrado" etc.
+            if colunas[1] != data_esperada or colunas[3] != busca["trecho"]:
+                de_outra_busca += 1
+                continue
+            validas.append(colunas)
+        return validas, de_outra_busca
+
+    # Garante que a tabela é desta busca (o site às vezes mostra a anterior)
+    for tentativa in range(1, 3):
+        pesquisar()
+        validas, de_outra_busca = ler_pagina()
+        esperas = 0
+        while de_outra_busca and not validas and esperas < 3:
+            log("Tabela ainda mostra a busca anterior, esperando atualizar...")
+            esperar_ajax(page, 3000)
+            validas, de_outra_busca = ler_pagina()
+            esperas += 1
+        if validas or not de_outra_busca:
+            break
+        log("Refazendo a busca...")
+    else:
+        raise RuntimeError(f"A tabela não atualizou para {busca['data']}.")
+
+    encontrados = []
+    for numero_pagina in range(1, 4):  # até 3 páginas de resultados
+        if numero_pagina > 1:
+            validas, _ = ler_pagina()
+        for colunas in validas:
+            horario = colunas[2][:5]  # '15:00:00' -> '15:00'
+            vagas = int(colunas[4]) if colunas[4].isdigit() else 0
+            if horario in horarios_desejados and vagas > 0:
+                encontrados.append((horario, vagas))
+        if not clicar_paginador(page, "ui-paginator-next"):
+            break
+
+    return encontrados
+
+# Últimas vagas avisadas por busca, para não repetir o mesmo alerta a cada 5 min
+# chave (data, sentido) -> {"horarios": set de horários avisados, "quando": datetime}
+ULTIMO_AVISO = {}
+LEMBRETE_MINUTOS = 30  # se a vaga continuar, lembra de novo depois desse tempo
+
+def avisar_vagas(busca, encontrados):
+    chave = (busca["data"], busca["sentido"])
+    if not encontrados:
+        ULTIMO_AVISO.pop(chave, None)  # vaga sumiu: se voltar, avisa de novo
+        log(f"Nenhuma vaga em {busca['data']}.")
+        return
+
+    agora = datetime.now(FUSO_SALVADOR)
+    horarios = {h for h, _ in encontrados}
+    anterior = ULTIMO_AVISO.get(chave)
+    tem_novidade = anterior is None or not horarios <= anterior["horarios"]
+    lembrete = anterior is not None and agora - anterior["quando"] >= timedelta(minutes=LEMBRETE_MINUTOS)
+
+    if not tem_novidade and not lembrete:
+        log(f"Vagas em {busca['data']} já avisadas, sem novidade.")
+        return
+
+    linhas = [
+        f"⏰ {formatar_hora(h)} · 🚗 {v} {'vaga' if v == 1 else 'vagas'}"
+        for h, v in sorted(encontrados)
+    ]
+    titulo = "🚨 VAGA NO FERRY! 🚨" if tem_novidade else "🔔 Ainda tem vaga!"
+    mensagem = (
+        f"{titulo}\n\n"
+        f"{icone_sentido(busca['sentido'])} {busca['sentido']}\n"
+        f"📅 {formatar_data(busca['data'])}\n\n"
+        + "\n".join(linhas)
+        + "\n\n👉 Corra no site!"
+    )
+    enviar_notificacao(mensagem)
+    ULTIMO_AVISO[chave] = {"horarios": horarios, "quando": agora}
+
+def buscas_futuras():
+    hoje = datetime.now(FUSO_SALVADOR).date()
+    return [b for b in BUSCAS if datetime.strptime(b["data"], "%d/%m/%Y").date() >= hoje]
+
 def monitorar_travessia():
+    """Faz uma rodada completa. Devolve None se deu tudo certo, ou o último erro."""
+    buscas = buscas_futuras()
+    if not buscas:
+        log("Todas as datas já passaram. Nada para checar.")
+        return None
+
+    ultimo_erro = None
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
 
         try:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Acessando o portal...")
+            log("Acessando o portal...")
             page.goto("https://portalsigomits.internacionaltravessias.com.br:8744/wbc-st5/ui/login.faces?uat=12", timeout=120000, wait_until="domcontentloaded")
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Preenchendo login...")
+            log("Preenchendo login...")
             page.fill('[id="frm_login_component:formLogin:username"]', USUARIO_SIGOM)
             page.fill('[id="frm_login_component:formLogin:password"]', SENHA_SIGOM)
             page.click('[id="frm_login_component:formLogin:btnConectarLogin"]')
 
             page.wait_for_timeout(4000)
-            
+
             # --- MENU: Tickets > Hora Marcada - Veículo ---
             # A página pode ter mais de um item com esse texto (um deles oculto),
             # então clicamos só no visível; se nenhum aparecer, clicamos via JavaScript.
@@ -105,76 +248,29 @@ def monitorar_travessia():
             try:
                 item_menu.filter(visible=True).first.click(timeout=10000)
             except Exception:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Item do menu oculto, clicando via JavaScript...")
+                log("Item do menu oculto, clicando via JavaScript...")
                 item_menu.first.evaluate("el => (el.closest('a') || el).click()")
 
             page.wait_for_timeout(3000)
-
-            for busca in BUSCAS:
-                data_atual = busca["data"]
-                trecho_atual = busca["trecho"]
-                sentido_atual = busca["sentido"]
-                horarios_atual = busca.get("horarios", HORARIOS_PADRAO)
-
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Filtros para {data_atual} ({sentido_atual})...")
-                preencher_data(page, data_atual)
-
-                page.click('[id="form:trecho"] .ui-selectonemenu-trigger')
-                page.wait_for_timeout(1000)
-                page.click(f'li:has-text("{trecho_atual}")')
-                page.click('[id="form:saveRequestButton"]')
-                
-                page.wait_for_timeout(6000)
-                alertas_vagas = []
-
-                for numero_pagina in range(1, 4):
-                    linhas = page.locator('[id="form:dataTableListaViagens"] tbody tr').all()
-                    for linha in linhas:
-                        colunas = linha.locator('td').all()
-                        if len(colunas) >= 5:
-                            horario_tabela = colunas[2].inner_text().strip()
-                            vagas_texto = colunas[4].inner_text().strip()
-                            vagas_disponiveis = int(vagas_texto) if vagas_texto.isdigit() else 0
-
-                            if horario_tabela in horarios_atual and vagas_disponiveis > 0:
-                                palavra = "vaga" if vagas_disponiveis == 1 else "vagas"
-                                alertas_vagas.append(f"⏰ {formatar_hora(horario_tabela)} · 🚗 {vagas_disponiveis} {palavra}")
-
-                    botao_proximo = page.locator('.ui-paginator-next').first
-                    classe_botao = botao_proximo.get_attribute('class') or ""
-                    
-                    if botao_proximo.count() > 0 and 'ui-state-disabled' not in classe_botao:
-                        botao_proximo.click()
-                        page.wait_for_timeout(3000)
-                    else:
-                        break 
-
-                if alertas_vagas:
-                    linhas_mensagem = "\n".join(alertas_vagas)
-                    mensagem = (
-                        f"🚨 VAGA NO FERRY! 🚨\n\n"
-                        f"{icone_sentido(sentido_atual)} {sentido_atual}\n"
-                        f"📅 {formatar_data(data_atual)}\n\n"
-                        f"{linhas_mensagem}\n\n"
-                        f"👉 Corra no site!"
-                    )
-                    enviar_notificacao(mensagem)
-                else:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Nenhuma vaga em {data_atual}.")
-
         except Exception as e:
-            msg_erro = (
-                f"⚠️ Problema no bot\n\n"
-                f"O site do Sigom falhou\n"
-                f"ou está lento.\n\n"
-                f"Motivo:\n{resumir_erro(e)}\n\n"
-                f"🔄 Tento de novo em {INTERVALO_CHECAGEM // 60} min"
-            )
-            enviar_notificacao(msg_erro)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Erro: {e}")
-        finally:
+            log(f"Erro no login/menu: {e}")
             context.close()
             browser.close()
+            return e
+
+        # Cada data tem seu próprio try: erro numa não impede a checagem das outras
+        for busca in buscas:
+            print()
+            log(f"Filtros para {busca['data']} ({busca['sentido']})...")
+            try:
+                avisar_vagas(busca, ler_vagas(page, busca))
+            except Exception as e:
+                log(f"Erro em {busca['data']}: {e}")
+                ultimo_erro = e
+
+        context.close()
+        browser.close()
+    return ultimo_erro
 
 # ==========================================
 # 3. SERVIDOR FLASK (RENDER) E LOOP
@@ -225,6 +321,8 @@ def resumir_erro(erro):
         resumo = "Um botão ou menu do site não apareceu."
     elif "context was destroyed" in texto:
         resumo = "A página recarregou no meio da busca."
+    elif "não atualizou" in texto:
+        resumo = "O site não carregou os resultados da busca."
     elif "net::" in texto or "ERR_" in texto:
         resumo = "Sem conexão com o site."
     else:
@@ -270,27 +368,84 @@ def montar_mensagem_inicio():
     ]
     return "\n".join(linhas)
 
+FALHAS_PARA_AVISAR = 2  # só avisa erro depois de N rodadas seguidas falhando
+
+def validar_configuracao():
+    """Confere .env e BUSCAS antes de começar. Devolve lista de problemas."""
+    problemas = []
+    for nome in ["USUARIO_SIGOM", "SENHA_SIGOM", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]:
+        if not os.environ.get(nome):
+            problemas.append(f"Variável {nome} não está no .env")
+    if not 0 <= HORA_DORMIR < HORA_ACORDAR <= 24:
+        problemas.append("HORA_DORMIR precisa ser menor que HORA_ACORDAR")
+    for i, b in enumerate(BUSCAS, 1):
+        for campo in ["data", "trecho", "sentido"]:
+            if not b.get(campo):
+                problemas.append(f"Busca {i}: falta o campo '{campo}'")
+        try:
+            datetime.strptime(b.get("data", ""), "%d/%m/%Y")
+        except ValueError:
+            problemas.append(f"Busca {i}: data '{b.get('data')}' inválida (use DD/MM/AAAA)")
+        for h in b.get("horarios", HORARIOS_PADRAO):
+            try:
+                datetime.strptime(h, "%H:%M")
+            except ValueError:
+                problemas.append(f"Busca {i}: horário '{h}' inválido (use HH:MM)")
+    return problemas
+
+def mensagem_erro(erro):
+    return (
+        f"⚠️ Problema no bot\n\n"
+        f"O site do Sigom falhou\n"
+        f"ou está lento.\n\n"
+        f"Motivo:\n{resumir_erro(erro)}\n\n"
+        f"🔄 Sigo tentando a cada {INTERVALO_CHECAGEM // 60} min"
+    )
+
 def iniciar_bot():
     print("Iniciando o bot de monitoramento do Ferry Boat...")
     enviar_notificacao(montar_mensagem_inicio())
 
+    falhas_seguidas = 0
     while True:
-        agora = datetime.now(FUSO_SALVADOR)
-        if HORA_DORMIR <= agora.hour < HORA_ACORDAR:
-            acordar = agora.replace(hour=HORA_ACORDAR, minute=0, second=0, microsecond=0)
-            segundos = (acordar - agora).total_seconds()
-            print(f"[{agora.strftime('%H:%M:%S')}] Hora de dormir. Volto às {HORA_ACORDAR:02d}:00...")
-            enviar_notificacao(f"😴 Boa noite!\n\nBot pausado até as {HORA_ACORDAR:02d}h.")
-            time.sleep(segundos)
-            enviar_notificacao("☀️ Bom dia!\n\nVoltei a monitorar\nas vagas.")
-            continue
+        try:
+            agora = datetime.now(FUSO_SALVADOR)
+            if HORA_DORMIR <= agora.hour < HORA_ACORDAR:
+                acordar = agora.replace(hour=HORA_ACORDAR, minute=0, second=0, microsecond=0)
+                segundos = (acordar - agora).total_seconds()
+                log(f"Hora de dormir. Volto às {HORA_ACORDAR:02d}:00...")
+                enviar_notificacao(f"😴 Boa noite!\n\nBot pausado até as {HORA_ACORDAR:02d}h.")
+                time.sleep(segundos)
+                enviar_notificacao("☀️ Bom dia!\n\nVoltei a monitorar\nas vagas.")
+                continue
 
-        monitorar_travessia()
-        tempo_espera = INTERVALO_CHECAGEM
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Aguardando {tempo_espera // 60} minutos...\n")
-        time.sleep(tempo_espera)
+            erro = monitorar_travessia()
+            if erro is None:
+                if falhas_seguidas >= FALHAS_PARA_AVISAR:
+                    enviar_notificacao("✅ Tudo certo!\n\nO site voltou a\nresponder.")
+                falhas_seguidas = 0
+            else:
+                falhas_seguidas += 1
+                log(f"Rodada com erro ({falhas_seguidas} seguida(s)).")
+                if falhas_seguidas == FALHAS_PARA_AVISAR:
+                    enviar_notificacao(mensagem_erro(erro))
+        except Exception:
+            # Nunca deixa a thread do bot morrer em silêncio
+            log("Erro inesperado no loop do bot:")
+            traceback.print_exc()
+
+        print()
+        log(f"Aguardando {INTERVALO_CHECAGEM // 60} minutos...\n")
+        time.sleep(INTERVALO_CHECAGEM)
 
 if __name__ == "__main__":
+    problemas = validar_configuracao()
+    if problemas:
+        print("❌ Corrija antes de iniciar o bot:")
+        for p in problemas:
+            print(f"  - {p}")
+        sys.exit(1)
+
     thread_bot = threading.Thread(target=iniciar_bot)
     thread_bot.daemon = True
     thread_bot.start()
