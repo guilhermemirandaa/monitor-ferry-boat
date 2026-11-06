@@ -1,0 +1,34 @@
+# Serviço systemd para rodar o bot 24/7 num servidor Linux (ex.: Oracle Cloud).
+#
+# - Continua rodando depois que você fecha o SSH
+# - Reinicia sozinho se o bot cair (Restart=always)
+# - Inicia sozinho quando a VM liga/reinicia (WantedBy=multi-user.target)
+#
+# Ajuste User e os caminhos se o seu usuário não for "ubuntu"
+# (no Oracle Linux o usuário padrão é "opc").
+#
+# Instalação:
+#   sudo cp deploy/ferry-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ferry-bot
+#
+# Ver logs:      journalctl -u ferry-bot -f
+# Reiniciar:     sudo systemctl restart ferry-bot   (depois de mudar datas/horários)
+# Ver status:    systemctl status ferry-bot
+
+[Unit]
+Description=Bot de monitoramento de vagas do Ferry Boat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/monitor-ferry-boat
+ExecStart=/home/ubuntu/monitor-ferry-boat/.venv/bin/python Itaparica/bot_travessia.py
+# Sem isso, os prints ficam presos no buffer e não aparecem no journalctl
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
